@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
-	"math/rand"
+	"io/ioutil"
+	"net/http"
 	"net/url"
 	"sort"
 	"strings"
@@ -12,6 +15,7 @@ import (
 )
 
 type Product struct {
+	ID string
 	Name string
 }
 
@@ -23,6 +27,46 @@ type ChainProductsResponse struct {
 
 type Client struct {
 	SkusLimit int
+}
+
+func sendRequest(ctx context.Context, method string) ([]byte, error) {
+	endpoint := "http://127.0.0.1:51000/product"
+	values := map[string]string{"foo": "baz"}
+	jsonData, err := json.Marshal(values)
+
+	client := &http.Client{}
+
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("Error Occurred. %+v", err)
+	}
+
+	response, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("Error sending request to API endpoint. %+v", err)
+	}
+
+	// Close the connection to reuse it
+	defer response.Body.Close()
+
+	if response.StatusCode < 200 || response.StatusCode > 299 {
+		fmt.Printf("Got unexpected status code from catalog : %v\n", response.Status)
+		respBody, err := ioutil.ReadAll(response.Body)
+		if err != nil {
+			return nil, fmt.Errorf("not expected HTTP status '%s' from catalog: %w", response.Status, err)
+		}
+
+		fmt.Printf("Body context of the failed request : %v\n", string(respBody))
+		return nil, fmt.Errorf("not expected HTTP status '%s' from catalog, body: %s", response.Status, string(respBody))
+	}
+
+
+	body, err := ioutil.ReadAll(response.Body)
+	if err != nil {
+		return nil, fmt.Errorf("Couldn't parse response body. %+v", err)
+	}
+
+	return body, nil
 }
 
 // SearchProducts allows to search products by term.
@@ -37,30 +81,54 @@ func (c *Client) SearchProducts(ctx context.Context, term string, skus []string)
 	fmt.Println(skuChunks, len(skuChunks))
 
 	searchProductsResponseChannel := make(chan ChainProductsResponse, len(skuChunks))
+
 	var wg sync.WaitGroup
 	wg.Add(len(skuChunks))
 
+	//This helps in Cancelling all request in case of any one response failure
+	var cancelFuncs []context.CancelFunc
+
 	for workerCount := 0; workerCount < len(skuChunks); workerCount++ {
-		go func(wc int) {
+
+		cancelCtx, cancel := context.WithCancel(ctx)
+		cancelFuncs = append(cancelFuncs, cancel)
+
+		go func(wc int, ctx context.Context) {
 			searchProductsResponseChannel <- c.searchProductsSerial(ctx, term, skuChunks[wc], wc)
 			wg.Done()
-		}(workerCount)
+		}(workerCount, cancelCtx)
 	}
 
-	wg.Wait()
-	close(searchProductsResponseChannel)
+	go func() {
+		wg.Wait()
+		close(searchProductsResponseChannel)
+	}()
 
+	var onlyOnce sync.Once
+	var errorFlag bool
+
+	//Merge all response. Cancel all request in case of err
 	var allProducts []Product
 	for response := range searchProductsResponseChannel {
 		if response.Err != nil {
-			fmt.Println("product error !!")
-			return ChainProductsResponse{Products: allProducts}, err
+			onlyOnce.Do(func() {
+				errorFlag = true
+				for _, cancel := range cancelFuncs {
+					cancel()
+				}
+				fmt.Println("all request cancelled!!")
+			})	
 		} else {
-			fmt.Println("product !!")
 			allProducts = append(allProducts, response.Products...)
 		}
 	}
-	return ChainProductsResponse{Products: allProducts}, nil
+	if errorFlag {
+		fmt.Println("respond with failure!!")
+		return ChainProductsResponse{}, err
+	} else {
+		fmt.Println("respond with success!!")
+		return ChainProductsResponse{Products: allProducts}, nil
+	}
 }
 
 func (c *Client) chunkSlice(skus []string, sizeOfChunk int) (chunks [][]string) {
@@ -111,28 +179,29 @@ func (c *Client) searchProductsSerial(ctx context.Context, term string, skus []s
 	skus = removeSkuDuplicates(skus)
 	searchQuery += fmt.Sprintf("limit=%v&skus=%v", len(skus)+1, strings.Join(skus, ","))
 
-	if rand.Intn(100)%2 == 0 {
-		fmt.Printf("worker:%d request sent - %s **error** \n", workerCount, searchQuery)
-		return ChainProductsResponse{Err: fmt.Errorf("failed to do anything")}
-	}
-
 	fmt.Printf("worker:%d request sent - %s\n", workerCount, searchQuery)
-	time.Sleep(10 * time.Millisecond)
-
+	
+	res, err := sendRequest(ctx,"GET")
+	if err != nil {
+		fmt.Printf("failed to sendRequest:%v\n", err)
+		return ChainProductsResponse{Products: []Product{},Err:err}
+	}
+		
 	/*res, err := c.request(ctx, http.MethodGet, c.Endpoints.ChainProducts, searchQuery, nil)
 	if err != nil {
 		return ChainProductsResponse{}, errors.Wrapf(err, "Failed to GET products from catalog, (method, URL, query): %v, %v, %v", http.MethodGet, c.Endpoints.ChainProducts, searchQuery)
 	}*/
 
-	/*err = json.Unmarshal(res, &chpr)
+	fmt.Printf("worker:%d request response - %v\n", workerCount, string(res))
+	var products []Product
+	err = json.Unmarshal(res, &products)
+
 	if err != nil {
-		return ChainProductsResponse{}, errors.Wrapf(err, "Failed to unmarshal json response from catalog for GET products")
-	}*/
+		fmt.Printf("failed to Unmarshal:%v\n", err)
+		return ChainProductsResponse{Products: []Product{},Err:err}
+	}
 	return ChainProductsResponse{
-		Products: []Product{
-			{Name: fmt.Sprintf("%d-1", workerCount)},
-			{Name: fmt.Sprintf("%d-2", workerCount)},
-		},
+		Products: products,
 		Err: nil,
 	}
 }
