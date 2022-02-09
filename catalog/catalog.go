@@ -20,19 +20,23 @@ func homePage(w http.ResponseWriter, r *http.Request) {
 }
 
 func returnProduct(w http.ResponseWriter, r *http.Request) {
-	Products := []Product{
-		{ID: "1", Name: "Product 1"},
-		{ID: "2", Name: "Product 2"},
-	}
-	min := 1000
-	max := 10000
+	min := 10
+	max := 100
 	timeout := rand.Intn(max - min) + min
 	time.Sleep(time.Duration(timeout)*time.Millisecond)
 
-	if rand.Intn(100)%2 == 0 {
-		fmt.Printf("forced failed response\n")
+	
+	ID1 := fmt.Sprintf("%v", timeout)
+	ID2 := fmt.Sprintf("%v", timeout + 1)
+	Products := []Product{
+		{ID: ID1, Name: fmt.Sprintf("Product %v", ID1)},
+		{ID: ID2, Name: fmt.Sprintf("Product %v", ID2)},
+	}
+
+	if timeout % 11 == 0 {
+		fmt.Printf("forced failed response ID1:%v ID2:%v\n", ID1, ID2)
 		//return ChainProductsResponse{Err: fmt.Errorf("failed to do anything")}
-		http.Error(w, "failed yo yo", http.StatusInternalServerError)
+		http.Error(w, "failed!!", http.StatusInternalServerError)
 		return
 	}
 
